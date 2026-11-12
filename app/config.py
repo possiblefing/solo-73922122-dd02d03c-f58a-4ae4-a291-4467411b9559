@@ -28,6 +28,7 @@ class Settings:
     rebuild_batch_size: int = 500
     rebuild_batch_delay_ms: int = 0
     db_busy_timeout_seconds: float = 30.0
+    prune_batch_size: int = 500
 
 
 def get_settings() -> Settings:
@@ -38,6 +39,7 @@ def get_settings() -> Settings:
         rebuild_batch_size=max(1, _env_int("REBUILD_BATCH_SIZE", 500)),
         rebuild_batch_delay_ms=max(0, _env_int("REBUILD_BATCH_DELAY_MS", 0)),
         db_busy_timeout_seconds=max(1.0, _env_float("DB_BUSY_TIMEOUT_SECONDS", 30.0)),
+        prune_batch_size=max(1, _env_int("PRUNE_BATCH_SIZE", 500)),
     )
 
 

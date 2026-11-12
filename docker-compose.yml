@@ -23,6 +23,8 @@ services:
       # Set to e.g. 250 for a visible live-rebuild demonstration.
       REBUILD_BATCH_DELAY_MS: "${REBUILD_BATCH_DELAY_MS:-0}"
       DB_BUSY_TIMEOUT_SECONDS: "${DB_BUSY_TIMEOUT_SECONDS:-30}"
+      # Default rows deleted per committed change-log prune batch.
+      PRUNE_BATCH_SIZE: "${PRUNE_BATCH_SIZE:-500}"
     volumes:
       - archive-data:/data
     restart: unless-stopped

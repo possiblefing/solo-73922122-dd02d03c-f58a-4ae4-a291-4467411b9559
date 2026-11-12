@@ -133,6 +133,57 @@ curl --get "$BASE/api/search" --data-urlencode 'q=resume'
 Deleted `ocr-002` remains absent, and returned titles/bodies are the corrected
 committed versions from the same SQLite snapshot as the hit.
 
+### 7. Prune the change log during a slow rebuild
+
+Every write/delete appends a full-content row to the durable `changes` log.
+Long-running OCR correction leaves superseded duplicate bodies there. The
+cleanup API deletes the prefix that no rebuild can still replay, in committed
+batches, without pausing corrections.
+
+```bash
+# Start another slow rebuild (keep -> fold or back).
+curl -sS -X POST "$BASE/api/index/rebuild" \
+  -H 'Content-Type: application/json' -d '{"accent_policy": "keep"}'
+
+# While it runs, correct and delete again, then prune with a high limit.
+curl -sS -X POST "$BASE/api/changes/prune" \
+  -H 'Content-Type: application/json' -d '{"upto_seq": 1000000}'
+```
+
+The response deletes only rows at/below the rebuild's registered snapshot
+base — the correction and deletion just committed sit above it and are
+retained for the catch-up replay:
+
+```json
+{
+  "effective_upto_seq": 12,
+  "deleted_count": 12,
+  "retained": {"from_seq": 13, "reason": "active rebuild job(s) ... still replay changes with seq > 12"},
+  "latest_seq": 14,
+  "remaining_count": 2
+}
+```
+
+If the rebuild has not pinned its snapshot yet, the call instead returns
+`"deferred": true` and deletes nothing — retry a moment later.
+`GET /api/changes/prune?upto_seq=1000000` previews the boundary without
+deleting.
+
+### 8. Prune again after the switch
+
+Once the job has succeeded, nothing depends on the log:
+
+```bash
+curl -sS -X POST "$BASE/api/changes/prune" \
+  -H 'Content-Type: application/json' -d '{"upto_seq": 1000000}'
+# deleted_count covers the remaining rows; latest_seq still reports the last
+# committed sequence, so the next correction gets a strictly higher revision.
+```
+
+Bounded calls (`"max_batches": 4`) return `"completed": false` when more work
+remains; an interruption keeps the committed batches and a retry of the same
+call continues. Concurrent prunes never double-count.
+
 ## Accent examples
 
 | Document word | `keep` query | `fold` query |
@@ -159,6 +210,8 @@ non-Latin combining marks are preserved.
 | `POST` | `/api/index/rebuild` | Queue/switch accent policy through a background rebuild. |
 | `GET` | `/api/index/status` | Active policy/generation, current job, progress, history. |
 | `GET` | `/api/index/jobs/{job_id}` | One rebuild job. |
+| `GET` | `/api/changes/prune` | Preview the safely prunable change-log prefix (no writes). |
+| `POST` | `/api/changes/prune` | Delete the safe change-log prefix in committed batches. |
 | `GET` | `/healthz` | Health and active policy. |
 
 `POST /api/index/rebuild` also accepts `?accent_policy=fold` for convenience.
@@ -211,6 +264,26 @@ Retired FTS tables are deliberately retained rather than dropped in the swap
 transaction. This avoids schema-lock surprises for an already-running query;
 generation history is visible in `/api/index/status`.
 
+Change-log pruning is coordinated with the rebuild lifecycle:
+
+* **Safety floor** — a rebuild that registered its snapshot base `B` has
+  already copied all page state committed up to `B` into its shadow index and
+  only replays `changes` rows with `seq > B`. The pruner deletes at most the
+  minimum registered `base_seq` over all active jobs, so corrections and
+  deletes committed during a rebuild are never removed before replay.
+* **Deferred while the snapshot start is unknown** — a claimed job with
+  `base_seq = 0` has not pinned its snapshot; pruning then deletes nothing and
+  reports `deferred: true`.
+* **Batched, never a long write lock** — every batch is a short
+  `BEGIN IMMEDIATE` transaction. Page writes interleave freely, concurrent
+  prunes serialise per batch (each row is deleted and counted exactly once),
+  and an interruption keeps completed batches so a retry continues.
+* **Sequence preservation** — pruning is a plain `DELETE`; `sqlite_sequence`
+  is never reset. After the log is emptied, the next change still gets a
+  higher `seq`, so page revisions never regress or get reused and a later
+  rebuild snapshot can never confuse a recycled sequence with a replayable
+  row. Only log rows are deleted: no `VACUUM`, no FTS/generation cleanup.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -220,6 +293,7 @@ generation history is visible in `/api/index/status`.
 | `REBUILD_BATCH_SIZE` | `500` | Scan/catch-up batch size. |
 | `REBUILD_BATCH_DELAY_MS` | `0` | Demo-only pacing per batch. |
 | `DB_BUSY_TIMEOUT_SECONDS` | `30` | SQLite writer wait. |
+| `PRUNE_BATCH_SIZE` | `500` | Default change-log rows deleted per committed prune batch. |
 
 ## Local development and tests
 
@@ -235,4 +309,8 @@ pytest -q
 
 The tests exercise exact vs folded search, a rebuild that finishes with a
 correction and a deletion submitted during the scan, duplicate job idempotency,
-and restart/stale-job recovery. They use temporary SQLite files.
+restart/stale-job recovery, and change-log pruning: deferred pruning before a
+rebuild registers its snapshot base, safe-prefix pruning during catch-up,
+retention of not-yet-replayed corrections/deletes, exact counting under
+concurrent prunes, batch-limit resume, and revision/sequence monotonicity
+after the log is emptied. They use temporary SQLite files.

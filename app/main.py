@@ -16,6 +16,7 @@ from .accents import AccentPolicy
 from .archive import delete_page, get_page, search, upsert_page
 from .config import SETTINGS
 from .db import claim_rebuild, connect, fail_job, get_job, get_status, init_db
+from .prune import prune_changes, prune_preview
 from .rebuild import cancel_local_rebuilds, start_rebuild_thread
 
 
@@ -49,6 +50,27 @@ page corrections and an online, background index rebuild.
 * A failed or interrupted rebuild leaves the previous generation active. The
   committed pages and change log are durable, so a restart can rebuild again.
 
+### Change-log cleanup (storage maintenance)
+
+Every page write/delete appends a full-content row to the durable change log.
+Long-running OCR correction leaves superseded duplicate bodies there.
+`POST /api/changes/prune` deletes the safe prefix of that log **in batches**:
+
+* It accepts a sequence upper limit (`upto_seq`) and deletes only rows that no
+  active rebuild can still replay (at or below every registered rebuild
+  snapshot base). Corrections/deletes committed during a rebuild sit above
+  that boundary and are never removed before the switch replays them.
+* If a rebuild has been claimed but has not registered its snapshot base yet,
+  pruning is **deferred** (nothing is deleted; retry later).
+* Each batch commits separately, so corrections are never paused by a long
+  lock, an interruption keeps completed batches, and a retry simply continues.
+  Concurrent prunes serialise per batch and never double-count.
+* The response reports the actual deleted count and the range that must still
+  be retained. `latest_seq` (the last committed sequence) is preserved forever,
+  so page revisions never regress or get reused after the log is emptied.
+* Only log rows are deleted; the SQLite file is not shrunk and retired index
+  generations are left alone. `GET /api/changes/prune` previews the boundary.
+
 ### Two-minute Swagger demo
 
 Use the **Try it out** controls below (or `curl`):
@@ -71,6 +93,15 @@ Use the **Try it out** controls below (or `curl`):
 6. **After success** — `GET /api/search?q=cafe` now finds `café`-spelled text,
    deleted pages stay deleted, and returned titles/bodies are the corrected
    committed versions.
+7. **Prune the change log during a slow rebuild** — with
+   `REBUILD_BATCH_DELAY_MS=250`, trigger another rebuild, then
+   `POST /api/changes/prune` with a high `upto_seq` while it runs. Only the
+   prefix at/below the rebuild's snapshot base is deleted; the response's
+   `retained.from_seq` shows the range still needed for replay. If the job has
+   not pinned its snapshot yet, the call defers (`deferred: true`) — retry.
+8. **Prune again after the switch** — once no rebuild is active, the same call
+   empties the log up to `upto_seq`. `latest_seq` still reports the last
+   committed sequence, and the next correction gets a higher revision.
 
 For a visible on-screen demonstration with a tiny dataset, run the API with
 `REBUILD_BATCH_DELAY_MS=250` (or increase the page count). The delay is only a
@@ -118,6 +149,44 @@ class PageUpsert(BaseModel):
 
     title: str = Field(default="", description="OCR page title (UTF-8, accents preserved)")
     body: str = Field(default="", description="OCR page body (UTF-8, accents preserved)")
+
+
+class PruneRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "Prune everything currently safe",
+                    "value": {"upto_seq": 1000000},
+                },
+                {
+                    "summary": "Prune up to a known sequence, bounded call",
+                    "value": {"upto_seq": 5000, "batch_size": 500, "max_batches": 4},
+                },
+            ]
+        },
+    )
+
+    upto_seq: int | None = Field(
+        default=None,
+        ge=0,
+        description="Delete change-log rows with seq up to and including this "
+        "limit. The safety floor imposed by active rebuilds always caps the "
+        "effective target. Omit to delete everything currently safe.",
+    )
+    batch_size: int | None = Field(
+        default=None,
+        ge=1,
+        le=10000,
+        description="Rows deleted per committed batch. Defaults to PRUNE_BATCH_SIZE.",
+    )
+    max_batches: int | None = Field(
+        default=None,
+        ge=1,
+        description="Bound the batches in this call. When the target is not "
+        "fully pruned the response has completed=false; retry to continue.",
+    )
 
 
 class RebuildRequest(BaseModel):
@@ -168,6 +237,10 @@ app = FastAPI(
         {
             "name": "index",
             "description": "Background generation rebuild and atomic accent-policy switch.",
+        },
+        {
+            "name": "maintenance",
+            "description": "Batched change-log cleanup coordinated with rebuilds.",
         },
         {"name": "ops", "description": "Health and documentation helpers."},
     ],
@@ -493,3 +566,57 @@ def index_job(
     if job is None:
         raise HTTPException(status_code=404, detail="rebuild job not found")
     return job
+
+
+@app.get(
+    "/api/changes/prune",
+    tags=["maintenance"],
+    summary="Preview the safely prunable change-log prefix (deletes nothing)",
+    response_description=(
+        "The effective pruning boundary, the range still required by active "
+        "rebuilds, and the preserved latest committed sequence."
+    ),
+)
+def prune_preview_endpoint(
+    upto_seq: Annotated[
+        int | None,
+        Query(
+            ge=0,
+            description="Prospective deletion upper limit to evaluate.",
+            examples=[1000000],
+        ),
+    ] = None,
+) -> dict:
+    try:
+        return prune_preview(upto_seq)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/changes/prune",
+    tags=["maintenance"],
+    summary="Delete the safe prefix of the change log in committed batches",
+    response_description=(
+        "Actual deleted count, the range that must still be retained for "
+        "rebuild replay, and the preserved latest committed sequence."
+    ),
+)
+def prune_endpoint(
+    request: Annotated[
+        PruneRequest | None,
+        Body(
+            description="Deletion upper limit and batching controls. An empty "
+            "body deletes everything currently safe."
+        ),
+    ] = None,
+) -> dict:
+    body = request or PruneRequest()
+    try:
+        return prune_changes(
+            upto_seq=body.upto_seq,
+            batch_size=body.batch_size,
+            max_batches=body.max_batches,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
